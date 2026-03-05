@@ -1,5 +1,5 @@
-# uniswap.py
 import time
+import threading
 from decimal import Decimal, getcontext
 from web3 import Web3
 
@@ -7,7 +7,8 @@ from config import NETWORKS, STABLES
 
 getcontext().prec = 50
 
-# ===== ABI =====
+# ----------------- ABIs -----------------
+
 ABI_FACTORY = [{
     "name": "getPool", "type": "function", "stateMutability": "view",
     "inputs": [
@@ -52,8 +53,48 @@ ABI_ERC20 = [
     {"name": "decimals", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"type": "uint8"}]},
 ]
 
+ABI_ERC721_ENUM = [
+    {"name": "balanceOf", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "owner", "type": "address"}],
+     "outputs": [{"type": "uint256"}]},
+    {"name": "tokenOfOwnerByIndex", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "owner", "type": "address"}, {"name": "index", "type": "uint256"}],
+     "outputs": [{"type": "uint256"}]},
+]
 
-# ===== HELPERS =====
+# ----------------- Thread-local cache -----------------
+
+_tls = threading.local()
+
+def _tls_cache():
+    if not hasattr(_tls, "cache"):
+        _tls.cache = {}
+    return _tls.cache
+
+
+def get_ctx(network_name: str, rpc_url: str):
+    """
+    Кэшируем w3 + контракты в thread-local, чтобы:
+    - не пересоздавать HTTPProvider на каждый вызов
+    - безопасно использовать в ThreadPool
+    """
+    key = (network_name, rpc_url)
+    cache = _tls_cache()
+    if key in cache:
+        return cache[key]
+
+    if network_name not in NETWORKS:
+        raise ValueError(f"Unknown network: {network_name}")
+
+    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 30}))
+    net = NETWORKS[network_name]
+    nfpm = w3.eth.contract(net["nfpm"], abi=ABI_NFPM)
+    factory = w3.eth.contract(net["factory"], abi=ABI_FACTORY)
+
+    cache[key] = (w3, nfpm, factory)
+    return cache[key]
+
+
 def call_or(fn, default):
     try:
         return fn()
@@ -62,7 +103,6 @@ def call_or(fn, default):
 
 
 def tick_price(tick: int, dec0: int, dec1: int) -> Decimal:
-    # token1 per token0
     return (Decimal("1.0001") ** Decimal(tick)) * (Decimal(10) ** Decimal(dec0 - dec1))
 
 
@@ -74,8 +114,7 @@ def fmt(x: Decimal) -> str:
 
 def get_amounts(liquidity: int, tick: int, tick_lower: int, tick_upper: int):
     """
-    Возвращает raw amounts (в минимальных единицах типа wei, но без учета decimals),
-    формулы Uniswap v3. Использует float -> небольшая погрешность возможна.
+    Возвращает raw amounts (без decimals).
     """
     L = float(liquidity)
 
@@ -96,21 +135,54 @@ def get_amounts(liquidity: int, tick: int, tick_lower: int, tick_upper: int):
     return Decimal(str(amount0)), Decimal(str(amount1))
 
 
-# ===== CORE =====
-def get_position_status(network_name: str, token_id: int) -> str:
+def get_owner_token_ids(network_name: str, owner: str, rpc_url: str) -> list[int]:
     """
-    Возвращает текст ровно в структуре:
-    Price (min/max/cur), Position (WETH/USDC/TOTAL), Fees (WETH/USDC/TOTAL).
-    Поддерживает пары WETH + (USDC/USDT/DAI). Если другая пара — вернёт ошибку.
+    Список tokenId Uniswap v3 position NFT у owner.
+    """
+    if network_name not in NETWORKS:
+        return []
+
+    w3, _, _ = get_ctx(network_name, rpc_url)
+    owner = Web3.to_checksum_address(owner)
+
+    nfpm_enum = w3.eth.contract(NETWORKS[network_name]["nfpm"], abi=ABI_ERC721_ENUM)
+    bal = int(nfpm_enum.functions.balanceOf(owner).call())
+
+    token_ids = []
+    for i in range(bal):
+        token_id = int(nfpm_enum.functions.tokenOfOwnerByIndex(owner, i).call())
+        token_ids.append(token_id)
+
+    return token_ids
+
+
+def is_position_nonzero_and_valid(network_name: str, token_id: int, rpc_url: str) -> bool:
+    """
+    True если позиция существует и liquidity > 0.
+    Быстро: только nfpm.positions().
+    """
+    if network_name not in NETWORKS:
+        return False
+
+    _, nfpm, _ = get_ctx(network_name, rpc_url)
+    try:
+        pos = nfpm.functions.positions(int(token_id)).call()
+        liquidity = int(pos[7])
+        return liquidity > 0
+    except Exception:
+        return False
+
+
+def get_position_status(network_name: str, token_id: int, rpc_url: str | None = None) -> str:
+    """
+    Возвращает текст по позиции.
     """
     if network_name not in NETWORKS:
         return f"❌ Unknown network: {network_name}"
+    if not rpc_url:
+        return "❌ RPC URL is not provided"
 
-    net = NETWORKS[network_name]
-    w3 = Web3(Web3.HTTPProvider(net["rpc"], request_kwargs={"timeout": 30}))
-
-    nfpm = w3.eth.contract(net["nfpm"], abi=ABI_NFPM)
-    factory = w3.eth.contract(net["factory"], abi=ABI_FACTORY)
+    w3, nfpm, factory = get_ctx(network_name, rpc_url)
 
     pos = nfpm.functions.positions(int(token_id)).call()
 
@@ -121,8 +193,23 @@ def get_position_status(network_name: str, token_id: int) -> str:
     tu = int(pos[6])
     liquidity = int(pos[7])
 
-    t0 = w3.eth.contract(token0, abi=ABI_ERC20)
-    t1 = w3.eth.contract(token1, abi=ABI_ERC20)
+    # Кэш ERC20 контрактов в thread-local
+    cache = _tls_cache()
+    ckey0 = ("erc20", network_name, rpc_url, token0)
+    ckey1 = ("erc20", network_name, rpc_url, token1)
+
+    if ckey0 in cache:
+        t0 = cache[ckey0]
+    else:
+        t0 = w3.eth.contract(token0, abi=ABI_ERC20)
+        cache[ckey0] = t0
+
+    if ckey1 in cache:
+        t1 = cache[ckey1]
+    else:
+        t1 = w3.eth.contract(token1, abi=ABI_ERC20)
+        cache[ckey1] = t1
+
     sym0 = call_or(lambda: t0.functions.symbol().call(), "UNK")
     sym1 = call_or(lambda: t1.functions.symbol().call(), "UNK")
     dec0 = int(call_or(lambda: t0.functions.decimals().call(), 18))
@@ -132,60 +219,53 @@ def get_position_status(network_name: str, token_id: int) -> str:
     if int(pool, 16) == 0:
         return "❌ Pool не найден"
 
-    tick = int(w3.eth.contract(pool, abi=ABI_POOL).functions.slot0().call()[1])
+    # slot0 контракт тоже кэшируем
+    pkey = ("pool", network_name, rpc_url, pool)
+    if pkey in cache:
+        pool_c = cache[pkey]
+    else:
+        pool_c = w3.eth.contract(pool, abi=ABI_POOL)
+        cache[pkey] = pool_c
 
-    # prices: token1 per token0
+    tick = int(pool_c.functions.slot0().call()[1])
+
     p_cur = tick_price(tick, dec0, dec1)
     p_min = tick_price(tl, dec0, dec1)
     p_max = tick_price(tu, dec0, dec1)
 
-    # amounts (token units)
     a0_raw, a1_raw = get_amounts(liquidity, tick, tl, tu)
     amount0 = a0_raw / (Decimal(10) ** Decimal(dec0))
     amount1 = a1_raw / (Decimal(10) ** Decimal(dec1))
 
-    # ---- enforce WETH + STABLE ----
-    # Want output specifically as WETH + USDC-like stable
-    # Determine where WETH is
     is_weth0 = (sym0 == "WETH")
     is_weth1 = (sym1 == "WETH")
-
     stable0 = (sym0 in STABLES)
     stable1 = (sym1 in STABLES)
 
     if not ((is_weth0 and stable1) or (is_weth1 and stable0)):
-        return f"❌ Сейчас формат вывода поддерживает только WETH + stables ({', '.join(STABLES)}). Пара: {sym0}/{sym1}"
+        return f"❌ Поддерживается только WETH + stables ({', '.join(STABLES)}). Пара: {sym0}/{sym1}"
 
-    # Convert prices to "stable per 1 WETH"
-    # p_cur is token1 per token0
     if is_weth0 and stable1:
-        # token0=WETH, token1=STABLE => p is STABLE per WETH already
-        stable_symbol = sym1
         p_weth = p_cur
         p_weth_min = p_min
         p_weth_max = p_max
-
         weth_amount = amount0
-        usdc_amount = amount1  # stable side (may be USDT/DAI etc)
+        usdc_amount = amount1
     else:
-        # token0=STABLE, token1=WETH => p is WETH per STABLE, invert to STABLE per WETH
-        stable_symbol = sym0
         p_weth = Decimal(1) / p_cur
         p_weth_min = Decimal(1) / p_min
         p_weth_max = Decimal(1) / p_max
-
         weth_amount = amount1
-        usdc_amount = amount0  # stable side
+        usdc_amount = amount0
 
-    # Value in "USDT" (actually stable ≈ USDT)
     weth_value_usdt = weth_amount * p_weth
     usdc_value_usdt = usdc_amount
     total_value = weth_value_usdt + usdc_value_usdt
 
-    # ---- Fees via collect() simulation ----
     owner = nfpm.functions.ownerOf(int(token_id)).call()
     U128_MAX = (1 << 128) - 1
 
+    # collect делаем как eth_call (через .call) — это ок, но RPC иногда может быть капризным
     collect0_raw, collect1_raw = nfpm.functions.collect(
         (int(token_id), owner, U128_MAX, U128_MAX)
     ).call({"from": owner})
@@ -193,7 +273,6 @@ def get_position_status(network_name: str, token_id: int) -> str:
     fees0 = Decimal(collect0_raw) / (Decimal(10) ** Decimal(dec0))
     fees1 = Decimal(collect1_raw) / (Decimal(10) ** Decimal(dec1))
 
-    # fees in terms of WETH + stable
     if is_weth0 and stable1:
         fees_weth = fees0
         fees_usdc = fees1
@@ -206,9 +285,6 @@ def get_position_status(network_name: str, token_id: int) -> str:
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    # === EXACT STRUCTURE AS YOU REQUESTED ===
-    # (Labels remain WETH/USDC, but stable can be USDT/DAI; you can rename later if want.)
-    # If you want the stable label to show real symbol, replace "USDC" below with stable_symbol.
     return (
         f"📊 Position {token_id}\n"
         f"{ts}\n\n"
