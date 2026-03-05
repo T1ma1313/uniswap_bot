@@ -1,8 +1,8 @@
 import os
-from dotenv import load_dotenv
 import time
 import json
 import requests
+from dotenv import load_dotenv
 from uniswap import get_position_status
 
 load_dotenv()
@@ -15,11 +15,15 @@ URL = f"https://api.telegram.org/bot{TOKEN}"
 offset = 0
 
 
-def send(chat_id, text):
-    requests.post(URL + "/sendMessage", json={
+def send(chat_id, text, reply_markup=None):
+    payload = {
         "chat_id": chat_id,
         "text": text
-    }, timeout=20)
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    requests.post(URL + "/sendMessage", json=payload, timeout=20)
 
 
 def updates():
@@ -41,6 +45,12 @@ def main():
     global offset
     print("Bot started...")
 
+    status_keyboard = {
+        "keyboard": [[{"text": "Статус всех позиций"}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
     while True:
         try:
             data = updates()
@@ -56,9 +66,13 @@ def main():
                 text = (msg.get("text") or "").strip()
 
                 if text == "/start":
-                    send(chat_id, "Бот работает 🚀\n/status — показать все позиции")
+                    send(
+                        chat_id,
+                        "Бот работает 🚀\nНажми кнопку \"Статус всех позиций\", чтобы показать все позиции.",
+                        reply_markup=status_keyboard
+                    )
 
-                elif text == "/status":
+                elif text == "Статус всех позиций":
                     send(chat_id, "⏳ Считаю все позиции...")
 
                     positions = load_positions()
@@ -67,14 +81,15 @@ def main():
                         try:
                             result = get_position_status(p["network"], p["token_id"])
 
-                            # добавляем заголовок перед каждым блоком
-                            header = f"🔹 {i}) {p.get('name', 'Position')} | {p['network']} | tokenId={p['token_id']}\n\n"
+                            header = (
+                                f"🔹 {i}) {p.get('name', 'Position')} | "
+                                f"{p['network']} | tokenId={p['token_id']}\n\n"
+                            )
                             send(chat_id, header + result)
 
                         except Exception as e:
                             send(chat_id, f"❌ ERROR {p.get('name','Position')} ({p['network']} #{p['token_id']}): {e}")
 
-                        # чуть-чуть пауза, чтобы не упереться в лимиты Telegram
                         time.sleep(0.3)
 
         except Exception as e:
