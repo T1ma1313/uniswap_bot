@@ -27,8 +27,8 @@ if not ALCHEMY_API_KEY:
 URL = f"https://api.telegram.org/bot{TOKEN}"
 offset = 0
 
-USERS_FILE = "users.json"
-POSITIONS_FILE = "positions.json"  # один файл для позиций всех пользователей
+USERS_FILE = "/root/uniswap_data/users.json"
+POSITIONS_FILE = "/root/uniswap_data/positions.json"
 
 pending_wallet = set()  # chat_id ожидающие ввод кошелька
 _lock = threading.Lock()
