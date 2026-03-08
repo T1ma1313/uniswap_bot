@@ -3,7 +3,7 @@ import threading
 from decimal import Decimal, getcontext
 from web3 import Web3
 
-from config import NETWORKS, STABLES
+from config import NETWORKS, STABLES, WRAPPED_NATIVE, USDC_BY_NETWORK
 
 getcontext().prec = 50
 
@@ -40,13 +40,25 @@ ABI_NFPM = [
      "outputs": [{"name": "amount0", "type": "uint256"}, {"name": "amount1", "type": "uint256"}]},
 ]
 
-ABI_POOL = [{
-    "name": "slot0", "type": "function", "stateMutability": "view", "inputs": [],
-    "outputs": [
-        {"type": "uint160"}, {"type": "int24"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint16"},
-        {"type": "uint8"}, {"type": "bool"}
-    ]
-}]
+ABI_POOL = [
+    {
+        "name": "slot0",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [
+            {"type": "uint160"}, {"type": "int24"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint16"},
+            {"type": "uint8"}, {"type": "bool"}
+        ]
+    },
+    {
+        "name": "liquidity",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"type": "uint128"}]
+    }
+]
 
 ABI_ERC20 = [
     {"name": "symbol", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"type": "string"}]},
@@ -111,6 +123,112 @@ def fmt(x: Decimal) -> str:
     whole, frac = s.split(".")
     return f"{int(whole):,}".replace(",", " ") + "," + frac
 
+def _safe_div(a: Decimal, b: Decimal) -> Decimal:
+    if b == 0:
+        return Decimal(0)
+    return a / b
+
+
+def _get_erc20_contract(w3, network_name: str, rpc_url: str, token: str):
+    cache = _tls_cache()
+    key = ("erc20", network_name, rpc_url, Web3.to_checksum_address(token))
+    if key in cache:
+        return cache[key]
+
+    c = w3.eth.contract(Web3.to_checksum_address(token), abi=ABI_ERC20)
+    cache[key] = c
+    return c
+
+
+def _get_pool_contract(w3, network_name: str, rpc_url: str, pool: str):
+    cache = _tls_cache()
+    key = ("pool", network_name, rpc_url, Web3.to_checksum_address(pool))
+    if key in cache:
+        return cache[key]
+
+    c = w3.eth.contract(Web3.to_checksum_address(pool), abi=ABI_POOL)
+    cache[key] = c
+    return c
+
+
+def _choose_best_weth_usdc_pool(network_name: str, rpc_url: str, w3, factory):
+    """
+    Ищем лучший референсный WETH/USDC pool по liquidity среди fee tiers.
+    """
+    cache = _tls_cache()
+    key = ("best_weth_usdc_pool", network_name, rpc_url)
+    now = time.time()
+
+    cached = cache.get(key)
+    if cached and (now - cached["ts"] < 30):
+        return cached["pool"], cached["fee"]
+
+    weth = WRAPPED_NATIVE[network_name]
+    usdc = USDC_BY_NETWORK[network_name]
+
+    best_pool = None
+    best_fee = None
+    best_liquidity = -1
+
+    for fee in (100, 500, 3000, 10000):
+        try:
+            pool = Web3.to_checksum_address(factory.functions.getPool(weth, usdc, fee).call())
+            if int(pool, 16) == 0:
+                continue
+
+            pool_c = _get_pool_contract(w3, network_name, rpc_url, pool)
+            liq = int(call_or(lambda: pool_c.functions.liquidity().call(), 0))
+
+            if liq > best_liquidity:
+                best_liquidity = liq
+                best_pool = pool
+                best_fee = fee
+        except Exception:
+            continue
+
+    cache[key] = {
+        "pool": best_pool,
+        "fee": best_fee,
+        "ts": now,
+    }
+    return best_pool, best_fee
+
+
+def _get_weth_price_usdt(network_name: str, rpc_url: str, w3, factory) -> Decimal | None:
+    """
+    Возвращает цену 1 WETH в USDT(≈USDC) из лучшего WETH/USDC пула.
+    Кэшируем на 30 секунд.
+    """
+    cache = _tls_cache()
+    key = ("weth_price_usdt", network_name, rpc_url)
+    now = time.time()
+
+    cached = cache.get(key)
+    if cached and (now - cached["ts"] < 30):
+        return cached["price"]
+
+    pool, _fee = _choose_best_weth_usdc_pool(network_name, rpc_url, w3, factory)
+    if not pool:
+        cache[key] = {"price": None, "ts": now}
+        return None
+
+    pool_c = _get_pool_contract(w3, network_name, rpc_url, pool)
+    tick = int(pool_c.functions.slot0().call()[1])
+
+    weth = WRAPPED_NATIVE[network_name]
+    usdc = USDC_BY_NETWORK[network_name]
+
+    # В Uniswap token0/token1 сортируются по адресу
+    if int(weth, 16) < int(usdc, 16):
+        # token0 = WETH, token1 = USDC
+        p = tick_price(tick, 18, 6)  # USDC per WETH
+    else:
+        # token0 = USDC, token1 = WETH
+        p = tick_price(tick, 6, 18)  # WETH per USDC
+        p = _safe_div(Decimal(1), p)  # USDC per WETH
+
+    cache[key] = {"price": p, "ts": now}
+    return p
 
 def get_amounts(liquidity: int, tick: int, tick_lower: int, tick_upper: int):
     """
@@ -176,6 +294,10 @@ def is_position_nonzero_and_valid(network_name: str, token_id: int, rpc_url: str
 def get_position_status(network_name: str, token_id: int, rpc_url: str | None = None) -> str:
     """
     Возвращает текст по позиции.
+    Поддержка valuation:
+    - stable / any
+    - WETH / any
+    - fallback для any / any без stable и без WETH
     """
     if network_name not in NETWORKS:
         return f"❌ Unknown network: {network_name}"
@@ -193,22 +315,8 @@ def get_position_status(network_name: str, token_id: int, rpc_url: str | None = 
     tu = int(pos[6])
     liquidity = int(pos[7])
 
-    # Кэш ERC20 контрактов в thread-local
-    cache = _tls_cache()
-    ckey0 = ("erc20", network_name, rpc_url, token0)
-    ckey1 = ("erc20", network_name, rpc_url, token1)
-
-    if ckey0 in cache:
-        t0 = cache[ckey0]
-    else:
-        t0 = w3.eth.contract(token0, abi=ABI_ERC20)
-        cache[ckey0] = t0
-
-    if ckey1 in cache:
-        t1 = cache[ckey1]
-    else:
-        t1 = w3.eth.contract(token1, abi=ABI_ERC20)
-        cache[ckey1] = t1
+    t0 = _get_erc20_contract(w3, network_name, rpc_url, token0)
+    t1 = _get_erc20_contract(w3, network_name, rpc_url, token1)
 
     sym0 = call_or(lambda: t0.functions.symbol().call(), "UNK")
     sym1 = call_or(lambda: t1.functions.symbol().call(), "UNK")
@@ -219,16 +327,10 @@ def get_position_status(network_name: str, token_id: int, rpc_url: str | None = 
     if int(pool, 16) == 0:
         return "❌ Pool не найден"
 
-    # slot0 контракт тоже кэшируем
-    pkey = ("pool", network_name, rpc_url, pool)
-    if pkey in cache:
-        pool_c = cache[pkey]
-    else:
-        pool_c = w3.eth.contract(pool, abi=ABI_POOL)
-        cache[pkey] = pool_c
-
+    pool_c = _get_pool_contract(w3, network_name, rpc_url, pool)
     tick = int(pool_c.functions.slot0().call()[1])
 
+    # p_cur = token1 per token0
     p_cur = tick_price(tick, dec0, dec1)
     p_min = tick_price(tl, dec0, dec1)
     p_max = tick_price(tu, dec0, dec1)
@@ -242,30 +344,34 @@ def get_position_status(network_name: str, token_id: int, rpc_url: str | None = 
     stable0 = (sym0 in STABLES)
     stable1 = (sym1 in STABLES)
 
-    if not ((is_weth0 and stable1) or (is_weth1 and stable0)):
-        return f"❌ Поддерживается только WETH + stables ({', '.join(STABLES)}). Пара: {sym0}/{sym1}"
+    price0_usdt = None
+    price1_usdt = None
 
-    if is_weth0 and stable1:
-        p_weth = p_cur
-        p_weth_min = p_min
-        p_weth_max = p_max
-        weth_amount = amount0
-        usdc_amount = amount1
-    else:
-        p_weth = Decimal(1) / p_cur
-        p_weth_min = Decimal(1) / p_min
-        p_weth_max = Decimal(1) / p_max
-        weth_amount = amount1
-        usdc_amount = amount0
+    # 1) stable / any
+    if stable0:
+        price0_usdt = Decimal(1)
+        price1_usdt = _safe_div(Decimal(1), p_cur)
+    elif stable1:
+        price0_usdt = p_cur
+        price1_usdt = Decimal(1)
 
-    weth_value_usdt = weth_amount * p_weth
-    usdc_value_usdt = usdc_amount
-    total_value = weth_value_usdt + usdc_value_usdt
+    # 2) WETH / any
+    elif is_weth0 or is_weth1:
+        weth_price_usdt = _get_weth_price_usdt(network_name, rpc_url, w3, factory)
+
+        if weth_price_usdt is not None:
+            if is_weth0:
+                # p_cur = token1 per WETH
+                price0_usdt = weth_price_usdt
+                price1_usdt = _safe_div(weth_price_usdt, p_cur)
+            else:
+                # p_cur = WETH per token0
+                price0_usdt = p_cur * weth_price_usdt
+                price1_usdt = weth_price_usdt
 
     owner = nfpm.functions.ownerOf(int(token_id)).call()
     U128_MAX = (1 << 128) - 1
 
-    # collect делаем как eth_call (через .call) — это ок, но RPC иногда может быть капризным
     collect0_raw, collect1_raw = nfpm.functions.collect(
         (int(token_id), owner, U128_MAX, U128_MAX)
     ).call({"from": owner})
@@ -273,31 +379,49 @@ def get_position_status(network_name: str, token_id: int, rpc_url: str | None = 
     fees0 = Decimal(collect0_raw) / (Decimal(10) ** Decimal(dec0))
     fees1 = Decimal(collect1_raw) / (Decimal(10) ** Decimal(dec1))
 
-    if is_weth0 and stable1:
-        fees_weth = fees0
-        fees_usdc = fees1
-    else:
-        fees_weth = fees1
-        fees_usdc = fees0
-
-    fees_weth_usdt = fees_weth * p_weth
-    fees_total_usdt = fees_weth_usdt + fees_usdc
-
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
 
+    pair_price_block = (
+        f"💱 Pair {sym0}/{sym1}\n"
+        f"min: {fmt(p_min)} {sym1}/{sym0}\n"
+        f"max: {fmt(p_max)} {sym1}/{sym0}\n"
+        f"cur: {fmt(p_cur)} {sym1}/{sym0}\n\n"
+    )
+
+    # Если USDT valuation доступен
+    if price0_usdt is not None and price1_usdt is not None:
+        value0_usdt = amount0 * price0_usdt
+        value1_usdt = amount1 * price1_usdt
+        total_value = value0_usdt + value1_usdt
+
+        fees0_usdt = fees0 * price0_usdt
+        fees1_usdt = fees1 * price1_usdt
+        fees_total_usdt = fees0_usdt + fees1_usdt
+
+        return (
+            f"📊 Position {token_id}\n"
+            f"{ts}\n\n"
+            f"{pair_price_block}"
+            f"💧 Position\n"
+            f"{sym0}: {amount0:.6f} (~{fmt(value0_usdt)} USDT)\n"
+            f"{sym1}: {amount1:.6f} (~{fmt(value1_usdt)} USDT)\n"
+            f"TOTAL: {fmt(total_value)} USDT\n\n"
+            f"💸 Fees\n"
+            f"{sym0}: {fees0:.6f}\n"
+            f"{sym1}: {fees1:.6f}\n"
+            f"TOTAL: {fmt(fees_total_usdt)} USDT"
+        )
+
+    # fallback для any/any без stable и без WETH
     return (
         f"📊 Position {token_id}\n"
         f"{ts}\n\n"
-        f"💰 Price\n"
-        f"min: {fmt(p_weth_min)}\n"
-        f"max: {fmt(p_weth_max)}\n"
-        f"cur: {fmt(p_weth)}\n\n"
+        f"{pair_price_block}"
         f"💧 Position\n"
-        f"WETH: {weth_amount:.6f} (~{fmt(weth_value_usdt)} USDT)\n"
-        f"USDC: {usdc_amount:.2f} (~{fmt(usdc_value_usdt)} USDT)\n"
-        f"TOTAL: {fmt(total_value)} USDT\n\n"
+        f"{sym0}: {amount0:.6f}\n"
+        f"{sym1}: {amount1:.6f}\n\n"
         f"💸 Fees\n"
-        f"WETH: {fees_weth:.6f}\n"
-        f"USDC: {fees_usdc:.6f}\n"
-        f"TOTAL: {fmt(fees_total_usdt)} USDT"
+        f"{sym0}: {fees0:.6f}\n"
+        f"{sym1}: {fees1:.6f}\n\n"
+        f"ℹ️ USDT valuation unavailable for pair {sym0}/{sym1}"
     )

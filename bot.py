@@ -27,8 +27,8 @@ if not ALCHEMY_API_KEY:
 URL = f"https://api.telegram.org/bot{TOKEN}"
 offset = 0
 
-USERS_FILE = "/root/uniswap_data/users.json"
-POSITIONS_FILE = "/root/uniswap_data/positions.json"
+USERS_FILE = os.getenv("USERS_FILE", "/root/uniswap_data/users.json")
+POSITIONS_FILE = os.getenv("POSITIONS_FILE", "/root/uniswap_data/positions.json")
 
 pending_wallet = set()  # chat_id ожидающие ввод кошелька
 _lock = threading.Lock()
@@ -171,6 +171,59 @@ def _discover_network_positions(net: str, wallet: str, rpc: str, existing_set: s
 
     return new_positions, scanned, skipped
 
+def _prune_existing_positions(chat_id_str: str, positions_map: dict):
+    """
+    Проверяет уже сохранённые позиции пользователя.
+    Удаляет только те, для которых точно известно, что liquidity == 0.
+    Если по позиции была ошибка проверки, НЕ удаляем её.
+
+    Возвращает:
+      removed_count, checked_count
+    """
+    user_positions = positions_map.get(chat_id_str, [])
+    if not user_positions:
+        return 0, 0
+
+    checked = 0
+    removed = 0
+    kept = []
+
+    max_workers = min(16, max(4, (os.cpu_count() or 4)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut_map = {}
+
+        for p in user_positions:
+            try:
+                net = p.get("network")
+                token_id = int(p.get("token_id"))
+                rpc = build_rpc(net)
+            except Exception as e:
+                print(f"PRUNE SKIP INVALID POSITION {p}: {e}")
+                kept.append(p)
+                continue
+
+            fut = ex.submit(is_position_nonzero_and_valid, net, token_id, rpc_url=rpc)
+            fut_map[fut] = p
+
+        for fut in as_completed(fut_map):
+            p = fut_map[fut]
+            checked += 1
+
+            try:
+                ok = fut.result()
+            except Exception as e:
+                print(f"PRUNE ERROR for {p}: {e}")
+                kept.append(p)
+                continue
+
+            if ok:
+                kept.append(p)
+            else:
+                removed += 1
+
+    positions_map[chat_id_str] = kept
+    return removed, checked
 
 def _calc_status_for_position(p: dict, rpc_url: str):
     # отдельная функция, чтобы удобнее параллелить
@@ -255,12 +308,27 @@ def main():
                         send(chat_id, "Сначала пришли wallet address (0x...) — отправь его следующим сообщением.")
                         continue
 
-                    send(chat_id, "🔎 Ищу активные позиции (liquidity > 0)...")
+                    send(chat_id, "🔎 Проверяю сохранённые позиции и ищу новые активные позиции (liquidity > 0)...")
 
                     with _lock:
                         positions_map.setdefault(chat_id_str, [])
+
+                    # 1) Чистим уже сохранённые позиции
+                    try:
+                        with _lock:
+                            removed_total, checked_existing = _prune_existing_positions(chat_id_str, positions_map)
+                            save_positions_map(positions_map)
+                    except Exception as e:
+                        removed_total = 0
+                        checked_existing = 0
+                        print(f"PRUNE FATAL ERROR: {e}")
+                        send(chat_id, f"⚠️ Не удалось проверить уже сохранённые позиции ({e})")
+
+                    # 2) Собираем уже существующие после очистки
+                    with _lock:
                         existing = {(p["network"], int(p["token_id"])) for p in positions_map[chat_id_str]}
 
+                    # 3) Ищем новые
                     added_total = 0
                     scanned_total = 0
                     skipped_total = 0
@@ -275,29 +343,26 @@ def main():
                             if new_pos:
                                 with _lock:
                                     positions_map[chat_id_str].extend(new_pos)
-
                                 added_total += len(new_pos)
 
                         except Exception as e:
+                            print(f"DISCOVER ERROR [{net}]: {e}")
                             send(chat_id, f"⚠️ {net}: не смог получить позиции ({e})")
 
                     with _lock:
                         save_positions_map(positions_map)
 
-                    if added_total == 0:
-                        send(
-                            chat_id,
-                            f"✅ Готово. Новых активных позиций не найдено.\n"
-                            f"Проверено: {scanned_total}, пропущено: {skipped_total}\nЖми /status.",
-                            reply_markup=keyboard_main
-                        )
-                    else:
-                        send(
-                            chat_id,
-                            f"✅ Готово. Добавлено новых активных позиций: {added_total}\n"
-                            f"Проверено: {scanned_total}, пропущено: {skipped_total}\nЖми /status.",
-                            reply_markup=keyboard_main
-                        )
+                    send(
+                        chat_id,
+                        f"✅ Готово.\n"
+                        f"Проверено сохранённых: {checked_existing}\n"
+                        f"Удалено обнулённых: {removed_total}\n"
+                        f"Проверено новых: {scanned_total}\n"
+                        f"Пропущено: {skipped_total}\n"
+                        f"Добавлено новых активных позиций: {added_total}\n"
+                        f"Жми /status.",
+                        reply_markup=keyboard_main
+                    )
                     continue
 
                 if text == "/status":
