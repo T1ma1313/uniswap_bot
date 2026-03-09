@@ -3,7 +3,7 @@ import threading
 from decimal import Decimal, getcontext
 from web3 import Web3
 
-from config import NETWORKS, STABLES, WRAPPED_NATIVE, USDC_BY_NETWORK
+from config import NETWORKS, WRAPPED_NATIVE, USDC_BY_NETWORK, STABLES_BY_NETWORK
 
 getcontext().prec = 50
 
@@ -129,6 +129,10 @@ def _safe_div(a: Decimal, b: Decimal) -> Decimal:
     return a / b
 
 
+def _is_stable_token(network_name: str, token_address: str) -> bool:
+    return token_address in STABLES_BY_NETWORK.get(network_name, set())
+
+
 def _get_erc20_contract(w3, network_name: str, rpc_url: str, token: str):
     cache = _tls_cache()
     key = ("erc20", network_name, rpc_url, Web3.to_checksum_address(token))
@@ -234,23 +238,25 @@ def get_amounts(liquidity: int, tick: int, tick_lower: int, tick_upper: int):
     """
     Возвращает raw amounts (без decimals).
     """
-    L = float(liquidity)
+    L = Decimal(liquidity)
+    base = Decimal("1.0001")
+    half = Decimal("0.5")
 
-    sp = 1.0001 ** (tick / 2)
-    sa = 1.0001 ** (tick_lower / 2)
-    sb = 1.0001 ** (tick_upper / 2)
+    sp = base ** (Decimal(tick) * half)
+    sa = base ** (Decimal(tick_lower) * half)
+    sb = base ** (Decimal(tick_upper) * half)
 
     if tick <= tick_lower:
         amount0 = L * (sb - sa) / (sa * sb)
-        amount1 = 0.0
+        amount1 = Decimal(0)
     elif tick < tick_upper:
         amount0 = L * (sb - sp) / (sp * sb)
         amount1 = L * (sp - sa)
     else:
-        amount0 = 0.0
+        amount0 = Decimal(0)
         amount1 = L * (sb - sa)
 
-    return Decimal(str(amount0)), Decimal(str(amount1))
+    return amount0, amount1
 
 
 def get_owner_token_ids(network_name: str, owner: str, rpc_url: str) -> list[int]:
@@ -339,10 +345,11 @@ def get_position_status(network_name: str, token_id: int, rpc_url: str | None = 
     amount0 = a0_raw / (Decimal(10) ** Decimal(dec0))
     amount1 = a1_raw / (Decimal(10) ** Decimal(dec1))
 
-    is_weth0 = (sym0 == "WETH")
-    is_weth1 = (sym1 == "WETH")
-    stable0 = (sym0 in STABLES)
-    stable1 = (sym1 in STABLES)
+    native_wrapped = WRAPPED_NATIVE[network_name]
+    is_weth0 = (token0 == native_wrapped)
+    is_weth1 = (token1 == native_wrapped)
+    stable0 = _is_stable_token(network_name, token0)
+    stable1 = _is_stable_token(network_name, token1)
 
     price0_usdt = None
     price1_usdt = None

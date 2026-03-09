@@ -29,8 +29,10 @@ offset = 0
 
 USERS_FILE = os.getenv("USERS_FILE", "/root/uniswap_data/users.json")
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "/root/uniswap_data/positions.json")
+TELEGRAM_RETRIES = 3
 
 pending_wallet = set()  # chat_id ожидающие ввод кошелька
+active_jobs = set()  # (chat_id, job_name)
 _lock = threading.Lock()
 
 # один Session на весь процесс (быстрее, keep-alive)
@@ -83,22 +85,46 @@ def save_positions_map(data: dict):
     atomic_save_json(POSITIONS_FILE, data)
 
 
+def telegram_api(method: str, *, params=None, payload=None, timeout=20, retries=TELEGRAM_RETRIES):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            if payload is None:
+                r = HTTP.get(URL + f"/{method}", params=params, timeout=timeout)
+            else:
+                r = HTTP.post(URL + f"/{method}", json=payload, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok", False):
+                raise RuntimeError(f"Telegram API {method} failed: {data.get('description', 'unknown error')}")
+            return data
+        except (requests.RequestException, ValueError, RuntimeError) as e:
+            last_exc = e
+            if attempt + 1 >= retries:
+                break
+            time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(f"Telegram API {method} failed after {retries} attempts: {last_exc}")
+
+
 def send(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-    # Telegram иногда медлит — таймауты оставим разумные
-    HTTP.post(URL + "/sendMessage", json=payload, timeout=20)
+    try:
+        telegram_api("sendMessage", payload=payload, timeout=20, retries=TELEGRAM_RETRIES)
+    except Exception as e:
+        print(f"SEND ERROR chat_id={chat_id}: {e}")
 
 
 def updates():
     global offset
-    r = HTTP.get(
-        URL + "/getUpdates",
+    data = telegram_api(
+        "getUpdates",
         params={"timeout": 30, "offset": offset},
-        timeout=35
+        timeout=35,
+        retries=TELEGRAM_RETRIES + 2,
     )
-    return r.json()
+    return data.get("result", [])
 
 
 def build_rpc(network: str) -> str:
@@ -171,18 +197,17 @@ def _discover_network_positions(net: str, wallet: str, rpc: str, existing_set: s
 
     return new_positions, scanned, skipped
 
-def _prune_existing_positions(chat_id_str: str, positions_map: dict):
+def _prune_existing_positions(user_positions: list[dict]):
     """
     Проверяет уже сохранённые позиции пользователя.
     Удаляет только те, для которых точно известно, что liquidity == 0.
     Если по позиции была ошибка проверки, НЕ удаляем её.
 
     Возвращает:
-      removed_count, checked_count
+      kept_positions, removed_count, checked_count
     """
-    user_positions = positions_map.get(chat_id_str, [])
     if not user_positions:
-        return 0, 0
+        return [], 0, 0
 
     checked = 0
     removed = 0
@@ -222,12 +247,131 @@ def _prune_existing_positions(chat_id_str: str, positions_map: dict):
             else:
                 removed += 1
 
-    positions_map[chat_id_str] = kept
-    return removed, checked
+    return kept, removed, checked
 
 def _calc_status_for_position(p: dict, rpc_url: str):
     # отдельная функция, чтобы удобнее параллелить
     return get_position_status(p["network"], int(p["token_id"]), rpc_url=rpc_url)
+
+
+def _acquire_job(chat_id: int, job_name: str) -> bool:
+    key = (chat_id, job_name)
+    with _lock:
+        if key in active_jobs:
+            return False
+        active_jobs.add(key)
+    return True
+
+
+def _release_job(chat_id: int, job_name: str):
+    with _lock:
+        active_jobs.discard((chat_id, job_name))
+
+
+def _run_discover(chat_id: int, chat_id_str: str, wallet: str, positions_map: dict, keyboard_main: dict):
+    try:
+        send(chat_id, "🔎 Проверяю сохранённые позиции и ищу новые активные позиции (liquidity > 0)...")
+
+        with _lock:
+            current_positions = list(positions_map.get(chat_id_str, []))
+            positions_map.setdefault(chat_id_str, [])
+
+        try:
+            kept_positions, removed_total, checked_existing = _prune_existing_positions(current_positions)
+            with _lock:
+                positions_map[chat_id_str] = kept_positions
+                save_positions_map(positions_map)
+        except Exception as e:
+            removed_total = 0
+            checked_existing = 0
+            print(f"PRUNE FATAL ERROR: {e}")
+            send(chat_id, f"⚠️ Не удалось проверить уже сохранённые позиции ({e})")
+
+        with _lock:
+            existing = {(p["network"], int(p["token_id"])) for p in positions_map.get(chat_id_str, [])}
+
+        added_total = 0
+        scanned_total = 0
+        skipped_total = 0
+
+        for net in ("eth", "base", "arbitrum"):
+            try:
+                rpc = build_rpc(net)
+                new_pos, scanned, skipped = _discover_network_positions(net, wallet, rpc, existing)
+                scanned_total += scanned
+                skipped_total += skipped
+
+                if new_pos:
+                    with _lock:
+                        positions_map[chat_id_str].extend(new_pos)
+                    added_total += len(new_pos)
+
+            except Exception as e:
+                print(f"DISCOVER ERROR [{net}]: {e}")
+                send(chat_id, f"⚠️ {net}: не смог получить позиции ({e})")
+
+        with _lock:
+            save_positions_map(positions_map)
+
+        send(
+            chat_id,
+            f"✅ Готово.\n"
+            f"Проверено сохранённых: {checked_existing}\n"
+            f"Удалено обнулённых: {removed_total}\n"
+            f"Проверено новых: {scanned_total}\n"
+            f"Пропущено: {skipped_total}\n"
+            f"Добавлено новых активных позиций: {added_total}\n"
+            f"Жми /status.",
+            reply_markup=keyboard_main
+        )
+    finally:
+        _release_job(chat_id, "discover")
+
+
+def _run_status(chat_id: int, chat_id_str: str, positions_map: dict):
+    try:
+        with _lock:
+            user_positions = list(positions_map.get(chat_id_str, []))
+        if not user_positions:
+            send(chat_id, "У тебя пока нет позиций. Нажми /discover, чтобы найти их автоматически.")
+            return
+
+        send(chat_id, f"⏳ Считаю {len(user_positions)} позиции...")
+
+        tasks = []
+        for i, p in enumerate(user_positions, start=1):
+            try:
+                rpc_url = build_rpc(p["network"])
+            except Exception as e:
+                send(chat_id, f"⚠️ Некорректная сеть в позиции {p}: {e}")
+                continue
+            tasks.append((i, p, rpc_url))
+
+        if not tasks:
+            send(chat_id, "⚠️ Нет валидных позиций для расчёта /status.")
+            return
+
+        max_workers = min(12, max(4, (os.cpu_count() or 4)))
+        results = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut_map = {
+                ex.submit(_calc_status_for_position, p, rpc_url): (i, p, rpc_url)
+                for (i, p, rpc_url) in tasks
+            }
+            for fut in as_completed(fut_map):
+                i, p, _ = fut_map[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:
+                    results[i] = f"❌ ERROR: {e}"
+
+        for i, p, _ in tasks:
+            header = f"🔹 {i}) {p.get('name', 'Position')} | {p['network']} | tokenId={p['token_id']}\n\n"
+            send(chat_id, header + results.get(i, "❌ ERROR: empty result"))
+            time.sleep(0.15)
+    finally:
+        _release_job(chat_id, "status")
 
 
 def main():
@@ -248,9 +392,7 @@ def main():
 
     while True:
         try:
-            data = updates()
-
-            for u in data.get("result", []):
+            for u in updates():
                 offset = u["update_id"] + 1
 
                 msg = u.get("message")
@@ -307,62 +449,14 @@ def main():
                         pending_wallet.add(chat_id)
                         send(chat_id, "Сначала пришли wallet address (0x...) — отправь его следующим сообщением.")
                         continue
-
-                    send(chat_id, "🔎 Проверяю сохранённые позиции и ищу новые активные позиции (liquidity > 0)...")
-
-                    with _lock:
-                        positions_map.setdefault(chat_id_str, [])
-
-                    # 1) Чистим уже сохранённые позиции
-                    try:
-                        with _lock:
-                            removed_total, checked_existing = _prune_existing_positions(chat_id_str, positions_map)
-                            save_positions_map(positions_map)
-                    except Exception as e:
-                        removed_total = 0
-                        checked_existing = 0
-                        print(f"PRUNE FATAL ERROR: {e}")
-                        send(chat_id, f"⚠️ Не удалось проверить уже сохранённые позиции ({e})")
-
-                    # 2) Собираем уже существующие после очистки
-                    with _lock:
-                        existing = {(p["network"], int(p["token_id"])) for p in positions_map[chat_id_str]}
-
-                    # 3) Ищем новые
-                    added_total = 0
-                    scanned_total = 0
-                    skipped_total = 0
-
-                    for net in ("eth", "base", "arbitrum"):
-                        try:
-                            rpc = build_rpc(net)
-                            new_pos, scanned, skipped = _discover_network_positions(net, wallet, rpc, existing)
-                            scanned_total += scanned
-                            skipped_total += skipped
-
-                            if new_pos:
-                                with _lock:
-                                    positions_map[chat_id_str].extend(new_pos)
-                                added_total += len(new_pos)
-
-                        except Exception as e:
-                            print(f"DISCOVER ERROR [{net}]: {e}")
-                            send(chat_id, f"⚠️ {net}: не смог получить позиции ({e})")
-
-                    with _lock:
-                        save_positions_map(positions_map)
-
-                    send(
-                        chat_id,
-                        f"✅ Готово.\n"
-                        f"Проверено сохранённых: {checked_existing}\n"
-                        f"Удалено обнулённых: {removed_total}\n"
-                        f"Проверено новых: {scanned_total}\n"
-                        f"Пропущено: {skipped_total}\n"
-                        f"Добавлено новых активных позиций: {added_total}\n"
-                        f"Жми /status.",
-                        reply_markup=keyboard_main
-                    )
+                    if not _acquire_job(chat_id, "discover"):
+                        send(chat_id, "⏳ /discover уже выполняется. Подожди завершения.")
+                        continue
+                    threading.Thread(
+                        target=_run_discover,
+                        args=(chat_id, chat_id_str, wallet, positions_map, keyboard_main),
+                        daemon=True,
+                    ).start()
                     continue
 
                 if text == "/status":
@@ -372,41 +466,14 @@ def main():
                         pending_wallet.add(chat_id)
                         send(chat_id, "Сначала пришли wallet address (0x...) — отправь его следующим сообщением.")
                         continue
-
-                    user_positions = positions_map.get(chat_id_str, [])
-                    if not user_positions:
-                        send(chat_id, "У тебя пока нет позиций. Нажми /discover, чтобы найти их автоматически.")
+                    if not _acquire_job(chat_id, "status"):
+                        send(chat_id, "⏳ /status уже выполняется. Подожди завершения.")
                         continue
-
-                    send(chat_id, f"⏳ Считаю {len(user_positions)} позиции...")
-
-                    # Параллелим вычисления, но отправку сообщений делаем последовательно (чтобы не словить лимиты Telegram)
-                    tasks = []
-                    for i, p in enumerate(user_positions, start=1):
-                        rpc_url = build_rpc(p["network"])
-                        tasks.append((i, p, rpc_url))
-
-                    max_workers = min(12, max(4, (os.cpu_count() or 4)))
-                    results = {}
-
-                    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                        fut_map = {
-                            ex.submit(_calc_status_for_position, p, rpc_url): (i, p, rpc_url)
-                            for (i, p, rpc_url) in tasks
-                        }
-                        for fut in as_completed(fut_map):
-                            i, p, _ = fut_map[fut]
-                            try:
-                                results[i] = fut.result()
-                            except Exception as e:
-                                results[i] = f"❌ ERROR: {e}"
-
-                    # Отправляем в правильном порядке
-                    for i, p, _ in tasks:
-                        header = f"🔹 {i}) {p.get('name','Position')} | {p['network']} | tokenId={p['token_id']}\n\n"
-                        send(chat_id, header + results.get(i, "❌ ERROR: empty result"))
-                        time.sleep(0.15)  # небольшой лимит на отправку
-
+                    threading.Thread(
+                        target=_run_status,
+                        args=(chat_id, chat_id_str, positions_map),
+                        daemon=True,
+                    ).start()
                     continue
 
                 if text == "/help":
